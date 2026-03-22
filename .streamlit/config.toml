@@ -3,6 +3,12 @@ headless = true
 enableCORS = false
 enableXsrfProtection = false
 maxUploadSize = 5
+# 防止长时间任务时 WebSocket 断连
+enableWebsocketCompression = false
+maxMessageSize = 200
+
+[browser]
+gatherUsageStats = false
 
 [theme]
 primaryColor = "#37352F"

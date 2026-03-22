@@ -19,7 +19,7 @@ from review_radar.agent import ReviewRadarAgent
 from review_radar.report import save_report
 from review_radar.providers import list_provider_names, get_provider, fetch_models
 from review_radar.llm import set_runtime_config, check_health
-from review_radar.history import save_analysis, list_analyses, get_analysis
+from review_radar.history import save_analysis, list_analyses, get_analysis, user_hash_from_key
 
 # ── 文件缓存（防 session 丢失）──
 from review_radar.config import CACHE_TTL, CACHE_DIR as _CACHE_DIR_CFG
@@ -79,7 +79,9 @@ st.markdown("""
     .phase-item { padding: 6px 0; font-size: 15px; color: #37352F; }
     .phase-done { color: #787774; }
     .phase-active { font-weight: 600; }
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    header [data-testid="stHeader"] {visibility: visible !important;}
+    button[kind="header"] {visibility: visible !important;}
     .stButton > button { background-color: #37352F; color: white; border: none; padding: 12px 32px; font-size: 16px; border-radius: 4px; font-weight: 500; }
     .stButton > button:hover { background-color: #555555; }
 </style>
@@ -99,6 +101,7 @@ defaults = {
     "selected_platforms": [],
     "selected_countries": [],
     "count": 100,
+    "fetch_strategy": "mixed",
     "report": None,
     "aggregated": None,
     "analyzed_reviews": None,
@@ -134,14 +137,14 @@ with st.sidebar:
         key="_llm_provider_select",
     )
 
-    # 供应商切换时更新 base_url
+    # 供应商切换时更新 base_url 并加载预设模型
     provider_cfg = get_provider(selected_provider)
     if selected_provider != st.session_state.get("llm_provider"):
         st.session_state["llm_provider"] = selected_provider
         st.session_state["llm_base_url"] = provider_cfg["base_url"]
         st.session_state["llm_model"] = provider_cfg["default_model"]
         st.session_state["llm_health_ok"] = None
-        st.session_state["llm_models_list"] = []
+        st.session_state["llm_models_list"] = provider_cfg.get("known_models", [])
 
     # 自定义供应商显示 base_url 输入框
     if selected_provider == "自定义":
@@ -160,12 +163,12 @@ with st.sidebar:
     with col_fetch:
         if st.button("获取模型", disabled=not api_key or not base_url):
             with st.spinner("获取中..."):
-                models = fetch_models(api_key, base_url)
+                models, err = fetch_models(api_key, base_url)
                 st.session_state["llm_models_list"] = models
                 if models:
                     st.success(f"找到 {len(models)} 个模型")
                 else:
-                    st.warning("未获取到模型列表")
+                    st.warning(f"未获取到模型列表：{err}")
 
     with col_health:
         if st.button("测试连接", disabled=not api_key or not base_url):
@@ -191,6 +194,7 @@ with st.sidebar:
     # 应用配置到运行时
     if api_key and base_url and selected_model:
         set_runtime_config(api_key=api_key, base_url=base_url, model=selected_model)
+        st.session_state["user_hash"] = user_hash_from_key(api_key)
 
     # 健康状态指示
     health = st.session_state.get("llm_health_ok")
@@ -206,13 +210,17 @@ with st.sidebar:
 
     # ── 历史记录 ──
     st.markdown("### 📋 分析历史")
-    history = list_analyses(limit=20)
+    uh = st.session_state.get("user_hash", "")
+    if uh:
+        history = list_analyses(user_hash=uh, limit=20)
+    else:
+        history = []
     if history:
         for h in history:
             ts = datetime.fromtimestamp(h["timestamp"]).strftime("%m-%d %H:%M")
             label = f'{h["app_name"]} ({ts}, {h["review_count"]} 条)'
             if st.button(label, key=f"hist_{h['id']}"):
-                record = get_analysis(h["id"])
+                record = get_analysis(user_hash=uh, analysis_id=h["id"])
                 if record:
                     st.session_state.report = record.get("report_text", "")
                     st.session_state.aggregated = record.get("aggregated")
@@ -834,12 +842,27 @@ elif step == 3:
         st.session_state.count_input = 200
     if "confirm_start" not in st.session_state:
         st.session_state.confirm_start = False
+    if "fetch_strategy" not in st.session_state:
+        st.session_state.fetch_strategy = "mixed"
 
     st.number_input(
         "每个平台每个国家的评论数（最少 1）",
         min_value=1, max_value=2000, step=10,
         key="count_input",
     )
+
+    strategy_options = {
+        "混合（推荐）": "mixed",
+        "最新评论": "recent",
+        "最相关评论": "relevant",
+    }
+    strategy_label = st.selectbox(
+        "抓取策略",
+        options=list(strategy_options.keys()),
+        index=0,
+        help="混合：50% 最新 + 50% 最相关，覆盖面更广；最新：偏向近期评论；最相关：偏向高赞/热门评论",
+    )
+    st.session_state.fetch_strategy = strategy_options[strategy_label]
 
     actual_count = st.session_state.count_input
     n_countries = len(st.session_state.selected_countries)
@@ -901,58 +924,115 @@ elif step == 4:
             st.session_state.aggregated = cached.get("aggregated")
             st.session_state.analyzed_reviews = cached.get("analyzed_reviews")
             st.session_state.elapsed = cached.get("elapsed", 0)
+            st.session_state.step = 5
             _show_results()
             st.stop()
 
     st.markdown('<div class="step-title">Step 4: 分析中</div>', unsafe_allow_html=True)
 
-    # 用 st.status 展示实时进度（不触发 rerun）
-    with st.status("正在分析...", expanded=True) as status_ui:
-        log = st.empty()
-        lines = []
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, Future
 
-        def _log(icon, text):
-            lines.append(f"{icon} {text}")
-            log.markdown("\n\n".join(lines[-20:]))
+    # ── 用 cache_resource 存储跨 rerun 存活的任务状态 ──
+    @st.cache_resource(show_spinner=False)
+    def _get_running_task(task_key):
+        """返回一个跨 rerun 存活的任务容器"""
+        return {
+            "future": None,
+            "pool": None,
+            "agent": None,
+            "logs": [],
+            "lock": threading.Lock(),
+            "start_time": None,
+        }
 
-        def on_event(event_type, data):
-            if event_type == "phase":
-                phase = data.get("phase", "")
-                _log("🔄", f"**{phase}**")
-            elif event_type == "tool_call":
-                detail = data.get("input_summary", "")
-                _log("  ⚙️", detail)
-            elif event_type == "tool_result":
-                msg = data.get("message", "")
-                if msg:
-                    _log("  ✅", msg)
-            elif event_type == "agent_done":
-                _log("🎉", "**全部完成**")
+    task_key = f"analysis_{app_name_for_cache}_{count_for_cache}"
+    task = _get_running_task(task_key)
+
+    def _log_to_task(icon, text):
+        with task["lock"]:
+            task["logs"].append(f"{icon} {text}")
+
+    def on_event(event_type, data):
+        if event_type == "phase":
+            _log_to_task("🔄", f"**{data.get('phase', '')}**")
+        elif event_type == "tool_call":
+            _log_to_task("  ⚙️", data.get("input_summary", ""))
+        elif event_type == "tool_result":
+            msg = data.get("message", "")
+            if msg:
+                _log_to_task("  ✅", msg)
+        elif event_type == "fetch_progress":
+            fetched = data.get("fetched", 0)
+            total = data.get("total", 0)
+            platform = "App Store" if data.get("platform") == "app_store" else "Google Play"
+            country = COUNTRIES.get(data.get("country", ""), data.get("country", ""))
+            _log_to_task("  📥", f"{country} {platform}: 已抓取 {fetched}/{total} 条")
+        elif event_type == "agent_done":
+            _log_to_task("🎉", "**全部完成**")
+
+    # 只在没有运行中的任务时启动
+    if task["future"] is None or (task["future"].done() and task["future"].exception()):
+        task["logs"] = []
+        task["start_time"] = time.time()
+        fetch_strategy = st.session_state.get("fetch_strategy", "mixed")
 
         agent = ReviewRadarAgent(on_event=on_event)
-        start_time = time.time()
+        task["agent"] = agent
 
-        try:
-            report = agent.run(
+        def _run_agent():
+            return agent.run(
                 app_name=app_name_for_cache,
                 app_store_id=st.session_state.get("app_store_id"),
                 google_play_id=st.session_state.get("google_play_id"),
                 platforms=platforms_for_cache,
                 countries=countries_for_cache,
                 count_per_platform=count_for_cache,
+                fetch_strategy=fetch_strategy,
             )
+
+        task["pool"] = ThreadPoolExecutor(max_workers=1)
+        task["future"] = task["pool"].submit(_run_agent)
+
+    # ── 显示进度 ──
+    with st.status("正在分析...", expanded=True) as status_ui:
+        log_area = st.empty()
+
+        while task["future"] and not task["future"].done():
+            with task["lock"]:
+                snapshot = list(task["logs"][-20:])
+            if snapshot:
+                log_area.markdown("\n\n".join(snapshot))
+            time.sleep(2)
+
+        # 最终刷新
+        with task["lock"]:
+            snapshot = list(task["logs"][-20:])
+        if snapshot:
+            log_area.markdown("\n\n".join(snapshot))
+
+        # 获取结果
+        try:
+            report = task["future"].result()
         except Exception as e:
             status_ui.update(label="分析失败", state="error", expanded=True)
             st.error(f"错误: {e}")
+            # 清理缓存允许重试
+            _get_running_task.clear()
             if st.button("← 返回重试"):
                 st.session_state.step = 3
                 st.rerun()
             st.stop()
 
-        elapsed = time.time() - start_time
+        agent = task["agent"]
+        elapsed = time.time() - (task["start_time"] or time.time())
+
+        if task["pool"]:
+            task["pool"].shutdown(wait=False)
 
         if not report:
             status_ui.update(label="未生成报告", state="error")
+            _get_running_task.clear()
             st.stop()
 
         # 保存到 session
@@ -974,18 +1054,34 @@ elif step == 4:
 
         # 保存到分析历史
         try:
-            save_analysis(
-                app_name=app_name_for_cache or "unknown",
-                countries=countries_for_cache,
-                platforms=platforms_for_cache,
-                review_count=len(agent.analyzed_reviews or []),
-                aggregated=agent.aggregated,
-                report=report,
-            )
+            uh = st.session_state.get("user_hash", "")
+            if uh:
+                save_analysis(
+                    user_hash=uh,
+                    app_name=app_name_for_cache or "unknown",
+                    countries=countries_for_cache,
+                    platforms=platforms_for_cache,
+                    review_count=len(agent.analyzed_reviews or []),
+                    aggregated=agent.aggregated,
+                    report=report,
+                )
         except Exception:
             pass  # 历史保存失败不影响主流程
 
         status_ui.update(label=f"分析完成（耗时 {elapsed:.0f} 秒）", state="complete", expanded=False)
 
-    # 直接展示结果（不 rerun）
+    # 清理任务缓存
+    _get_running_task.clear()
+
+    # 标记完成，防止 rerun 时重新执行分析
+    st.session_state.step = 5
     _show_results()
+
+elif step == 5:
+    # rerun 后直接显示已有结果
+    if st.session_state.get("report"):
+        _show_results()
+    else:
+        # session 丢失，回到开始
+        st.session_state.step = 1
+        st.rerun()

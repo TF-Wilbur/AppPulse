@@ -8,6 +8,13 @@ from review_radar.scrapers import (
 )
 
 
+# mock time.sleep 避免重试等待
+@pytest.fixture(autouse=True)
+def no_sleep():
+    with patch("review_radar.scrapers.time.sleep"):
+        yield
+
+
 class TestMakeReviewId:
     def test_deterministic(self):
         id1 = _make_review_id("app_store", "Great app", "2026-01-01")
@@ -21,7 +28,7 @@ class TestMakeReviewId:
 
     def test_length(self):
         rid = _make_review_id("app_store", "test", "2026-01-01")
-        assert len(rid) == 12
+        assert len(rid) == 16
 
 
 class TestSearchAppStore:
@@ -158,6 +165,7 @@ class TestFetchAppStoreReviews:
     def test_http_error(self, mock_get):
         mock_resp = MagicMock()
         mock_resp.status_code = 404
+        mock_resp.request = MagicMock()
         mock_get.return_value = mock_resp
 
         reviews = fetch_app_store_reviews("123456", "us", count=10)

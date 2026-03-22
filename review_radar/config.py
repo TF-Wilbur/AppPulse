@@ -21,6 +21,9 @@ HTTP_TIMEOUT: int = int(os.environ.get("HTTP_TIMEOUT", "15"))
 FETCH_MAX_WORKERS: int = int(os.environ.get("FETCH_MAX_WORKERS", "3"))
 ANALYZE_MAX_WORKERS: int = int(os.environ.get("ANALYZE_MAX_WORKERS", "3"))
 FETCH_DELAY: float = float(os.environ.get("FETCH_DELAY", "0.3"))
+FETCH_MAX_RETRIES: int = int(os.environ.get("FETCH_MAX_RETRIES", "3"))
+FETCH_BACKOFF_BASE: float = float(os.environ.get("FETCH_BACKOFF_BASE", "1.5"))
+MIN_REVIEW_LENGTH: int = int(os.environ.get("MIN_REVIEW_LENGTH", "5"))
 
 # ── Web UI 配置 ──
 PAGE_SIZE: int = int(os.environ.get("PAGE_SIZE", "20"))

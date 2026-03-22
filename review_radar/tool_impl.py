@@ -19,6 +19,7 @@ from review_radar.prompts import (
 )
 from review_radar.llm import chat_simple
 from review_radar.availability import COUNTRIES
+from review_radar.config import MIN_REVIEW_LENGTH
 
 logger = logging.getLogger("review_radar.tool_impl")
 
@@ -85,6 +86,27 @@ def tool_search_app(app_name: str, country: str = "us") -> dict:
     }
 
 
+# ── 评论质量过滤 ──────────────────────────────────────────────
+
+_EMOJI_PATTERN = re.compile(
+    r'^[\s\U0001F600-\U0001F64F\U0001F300-\U0001F5FF'
+    r'\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF'
+    r'\U00002702-\U000027B0\U0000FE00-\U0000FE0F'
+    r'\U0000200D\U00002640\U00002642\U00002600-\U000026FF'
+    r'!?.,;:~*#@&%$^()+=\-_/\\|<>\[\]{}\'\"]+$'
+)
+
+
+def _is_low_quality(content: str) -> bool:
+    """判断评论是否低质量（过短、纯符号/表情）"""
+    stripped = content.strip()
+    if len(stripped) < MIN_REVIEW_LENGTH:
+        return True
+    if _EMOJI_PATTERN.match(stripped):
+        return True
+    return False
+
+
 # ── Tool 1: fetch_reviews ───────────────────────────────────────
 
 def tool_fetch_reviews(
@@ -93,8 +115,10 @@ def tool_fetch_reviews(
     count: int = 200,
     country: str = "us",
     platforms: list[str] | None = None,
+    fetch_strategy: str = "mixed",
+    on_progress=None,
 ) -> dict:
-    """抓取评论，同步调用避免 event loop 冲突"""
+    """抓取评论，支持 mixed/recent/relevant 策略"""
     if not app_store_id and not google_play_id:
         return {"error": "至少需要提供 app_store_id 或 google_play_id"}
 
@@ -103,19 +127,49 @@ def tool_fetch_reviews(
 
     reviews: list = []
 
-    if use_ios:
-        try:
-            ios_reviews = fetch_app_store_reviews(app_store_id, country, count)
-            reviews.extend(ios_reviews)
-        except Exception as e:
-            logger.warning("App Store 抓取失败: %s", e)
+    if fetch_strategy == "mixed":
+        # 50% 最新 + 50% 最相关，去重合并
+        half = max(count // 2, 1)
+        if use_ios:
+            try:
+                recent = fetch_app_store_reviews(app_store_id, country, half, sort="mostrecent", on_progress=on_progress)
+                helpful = fetch_app_store_reviews(app_store_id, country, half, sort="mosthelpful", on_progress=on_progress)
+                reviews.extend(recent)
+                reviews.extend(helpful)
+            except Exception as e:
+                logger.warning("App Store 抓取失败: %s", e)
+        if use_gplay:
+            try:
+                recent = fetch_google_play_reviews(google_play_id, half, country, sort="newest", on_progress=on_progress)
+                relevant = fetch_google_play_reviews(google_play_id, half, country, sort="relevant", on_progress=on_progress)
+                reviews.extend(recent)
+                reviews.extend(relevant)
+            except Exception as e:
+                logger.warning("Google Play 抓取失败: %s", e)
+    else:
+        ios_sort = "mosthelpful" if fetch_strategy == "relevant" else "mostrecent"
+        gplay_sort = "relevant" if fetch_strategy == "relevant" else "newest"
+        if use_ios:
+            try:
+                ios_reviews = fetch_app_store_reviews(app_store_id, country, count, sort=ios_sort, on_progress=on_progress)
+                reviews.extend(ios_reviews)
+            except Exception as e:
+                logger.warning("App Store 抓取失败: %s", e)
+        if use_gplay:
+            try:
+                gplay_result = fetch_google_play_reviews(google_play_id, count, country, sort=gplay_sort, on_progress=on_progress)
+                reviews.extend(gplay_result)
+            except Exception as e:
+                logger.warning("Google Play 抓取失败: %s", e)
 
-    if use_gplay:
-        try:
-            gplay_reviews = fetch_google_play_reviews(google_play_id, count, country)
-            reviews.extend(gplay_reviews)
-        except Exception as e:
-            logger.warning("Google Play 抓取失败: %s", e)
+    # 按 ID 去重（mixed 策略两次抓取可能重叠）
+    seen_ids = set()
+    deduped = []
+    for r in reviews:
+        if r.id not in seen_ids:
+            seen_ids.add(r.id)
+            deduped.append(r)
+    reviews = deduped
 
     # 按日期倒序
     reviews.sort(key=lambda x: x.date, reverse=True)
@@ -128,16 +182,24 @@ def tool_fetch_reviews(
             "id": r.id, "platform": r.platform, "rating": r.rating,
             "content": r.content, "date": r.date, "version": r.version,
             "title": r.title, "thumbs_up": r.thumbs_up, "country": r.country,
+            "low_quality": _is_low_quality(r.content),
         }
         for r in reviews
     ]
+
+    low_quality_count = sum(1 for r in reviews_data if r["low_quality"])
 
     return {
         "total_count": len(reviews),
         "app_store_count": app_store_count,
         "google_play_count": gplay_count,
+        "low_quality_count": low_quality_count,
         "reviews": reviews_data,
-        "message": f"共抓取 {len(reviews)} 条评论（App Store: {app_store_count}, Google Play: {gplay_count}）",
+        "message": (
+            f"共抓取 {len(reviews)} 条评论"
+            f"（App Store: {app_store_count}, Google Play: {gplay_count}"
+            f"，低质量: {low_quality_count} 条已标记）"
+        ),
     }
 
 

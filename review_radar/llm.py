@@ -1,6 +1,7 @@
 """LLM 客户端封装 — 支持多供应商 OpenAI 兼容接口"""
 
 import logging
+import re
 import time
 from functools import lru_cache
 
@@ -82,6 +83,11 @@ def chat(messages: list[dict], tools: list[dict] | None = None, max_tokens: int 
     return response
 
 
+def _strip_think_tags(text: str) -> str:
+    """移除 LLM 返回的 <think>...</think> 思维链内容"""
+    return re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+
+
 def chat_simple(prompt: str, system: str = "", max_tokens: int = 4096, retries: int = 3) -> str:
     """简单的单轮对话，返回文本。自动重试 + 指数退避"""
     messages = []
@@ -92,7 +98,8 @@ def chat_simple(prompt: str, system: str = "", max_tokens: int = 4096, retries: 
     for attempt in range(retries):
         try:
             response = chat(messages, max_tokens=max_tokens)
-            return response.choices[0].message.content or ""
+            content = response.choices[0].message.content or ""
+            return _strip_think_tags(content)
         except Exception as e:
             if attempt < retries - 1:
                 wait = 2 ** attempt

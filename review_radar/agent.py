@@ -32,6 +32,7 @@ class ReviewRadarAgent:
         countries: list[str] | None = None,
         count_per_platform: int = 100,
         country: str = "us",  # 向后兼容旧调用
+        fetch_strategy: str = "mixed",
     ) -> str:
         """运行 Agent 全流程
 
@@ -79,12 +80,21 @@ class ReviewRadarAgent:
         def _fetch_country(c_code):
             import time
             time.sleep(FETCH_DELAY)  # 简单速率限制
+
+            def _on_progress(fetched, total, platform, country):
+                self.on_event("fetch_progress", {
+                    "fetched": fetched, "total": total,
+                    "platform": platform, "country": country,
+                })
+
             return tool_fetch_reviews(
                 app_store_id=app_store_id if use_ios else None,
                 google_play_id=google_play_id if use_gplay else None,
                 count=count_per_platform,
                 country=c_code,
                 platforms=platforms,
+                fetch_strategy=fetch_strategy,
+                on_progress=_on_progress,
             )
 
         if len(countries) > 1:
@@ -126,32 +136,45 @@ class ReviewRadarAgent:
         if not all_reviews:
             return "未抓取到任何评论。"
 
-        # 评论去重（多国家抓取可能出现重复）
+        # 评论去重（ID 去重 + 内容去重）
         seen_ids = set()
+        seen_contents = set()
         deduped = []
         for r in all_reviews:
             rid = r["id"]
-            if rid not in seen_ids:
+            content_key = r.get("content", "").strip().lower()
+            if rid not in seen_ids and content_key not in seen_contents:
                 seen_ids.add(rid)
+                if content_key:
+                    seen_contents.add(content_key)
                 deduped.append(r)
         all_reviews = deduped
 
+        # 分离低质量评论（统计计入总数，但不送 LLM 分析）
+        quality_reviews = [r for r in all_reviews if not r.get("low_quality")]
+        low_quality_count = len(all_reviews) - len(quality_reviews)
+        if low_quality_count > 0:
+            self.on_event("tool_result", {
+                "tool": "fetch_reviews",
+                "message": f"过滤 {low_quality_count} 条低质量评论，{len(quality_reviews)} 条进入分析",
+            })
+
         # 样本量检查
-        if len(all_reviews) < 100:
+        if len(quality_reviews) < 100:
             self.on_event("warning", {
-                "message": f"⚠️ 仅抓取到 {len(all_reviews)} 条评论，样本量较小，分析结论仅供参考"
+                "message": f"⚠️ 仅有 {len(quality_reviews)} 条有效评论，样本量较小，分析结论仅供参考"
             })
 
         # ── Phase 2: 分批分析（并发）──
         self.on_event("phase", {"phase": "Phase 2: 分批分析"})
-        batches = [all_reviews[i:i + BATCH_SIZE] for i in range(0, len(all_reviews), BATCH_SIZE)]
+        batches = [quality_reviews[i:i + BATCH_SIZE] for i in range(0, len(quality_reviews), BATCH_SIZE)]
         all_batch_results = [None] * len(batches)
 
         if len(batches) > 1:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             self.on_event("tool_call", {
                 "tool": "analyze_batch",
-                "input_summary": f"并发分析 {len(batches)} 个批次（共 {len(all_reviews)} 条）",
+                "input_summary": f"并发分析 {len(batches)} 个批次（共 {len(quality_reviews)} 条）",
             })
             with ThreadPoolExecutor(max_workers=min(len(batches), ANALYZE_MAX_WORKERS)) as executor:
                 futures = {executor.submit(tool_analyze_batch, i, batch): i for i, batch in enumerate(batches)}
