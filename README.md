@@ -2,10 +2,6 @@
 
 App 用户评论洞察 Agent — 输入 App 名字，自动抓取 App Store & Google Play 评论，多维度 AI 分析，生成可视化洞察报告。
 
-## 在线体验
-
-[https://review-radar-1075086782695.asia-east1.run.app](https://review-radar-1075086782695.asia-east1.run.app)
-
 ## 功能特性
 
 **评论抓取**
