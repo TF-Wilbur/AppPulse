@@ -300,25 +300,33 @@ def fetch_google_play_reviews(
 
     reviews = []
     continuation_token = None
-    # 每页请求量：google_play_scraper 单次最多约 200 条
-    per_page = min(count, 200)
+    # 每页请求量：始终用较大值请求，提高效率
+    per_page = min(max(count, 100), 200)
     # 有日期过滤时多抓几页，因为过滤后数量会减少
     extra_pages = 5 if (date_from or date_to) else 0
-    max_pages = max((count // per_page) + 2, 5) + extra_pages  # 安全上限防止死循环
+    max_pages = max((count // per_page) + 3, 5) + extra_pages
+
+    logger.info("Google Play 开始抓取: app=%s, count=%d, per_page=%d, max_pages=%d, sort=%s",
+                app_id, count, per_page, max_pages, sort)
 
     try:
         for page in range(max_pages):
             if len(reviews) >= count:
                 break
 
-            def _do(token=continuation_token):
+            current_token = continuation_token  # 显式捕获当前 token
+
+            def _do():
                 return gplay_reviews(
                     app_id, lang=lang, country=country,
                     sort=sort_enum, count=per_page,
-                    continuation_token=token,
+                    continuation_token=current_token,
                 )
 
             result, continuation_token = _retry(_do)
+
+            logger.info("Google Play 第 %d 页: 返回 %d 条, has_token=%s",
+                        page + 1, len(result) if result else 0, continuation_token is not None)
 
             if not result:
                 break
@@ -354,9 +362,11 @@ def fetch_google_play_reviews(
 
             # 没有下一页了
             if continuation_token is None:
+                logger.info("Google Play 无更多页面，停止分页")
                 break
 
     except Exception as e:
-        logger.warning("Google Play 抓取失败（已重试）: %s", e)
+        logger.warning("Google Play 抓取失败（已重试）: %s", e, exc_info=True)
 
+    logger.info("Google Play 抓取完成: 共 %d 条 (目标 %d)", len(reviews), count)
     return reviews[:count]
