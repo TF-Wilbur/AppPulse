@@ -116,6 +116,34 @@ def search_google_play(app_name: str, bundle_id: str | None = None,
         ref_name = app_store_name or app_name
         ref_dev = (app_store_developer or "").lower().strip()
 
+        # 对 appId 为 None 的结果，尝试用 gplay_app 精确查询来补全
+        for r in results:
+            if r.get("appId"):
+                continue
+            # 尝试从 URL 字段提取 appId
+            url = r.get("url") or ""
+            if "id=" in url:
+                extracted_id = url.split("id=")[-1].split("&")[0]
+                if extracted_id:
+                    r["appId"] = extracted_id
+                    continue
+            # 尝试用名称猜测常见 package name 并验证
+            gp_name = (r.get("title") or "").lower().replace(" ", "")
+            gp_dev = (r.get("developer") or "").lower().strip()
+            # 常见模式：com.{developer}.{appname} 或 com.{appname}.android
+            candidates = [
+                f"com.{gp_name}.android",
+                f"com.{gp_dev.replace(' ', '').replace(',', '').replace('.', '')}.{gp_name}",
+            ]
+            for cand in candidates:
+                try:
+                    info = gplay_app(cand)
+                    if info and info.get("appId"):
+                        r["appId"] = info["appId"]
+                        break
+                except Exception:
+                    continue
+
         for r in results:
             if not r.get("appId"):
                 continue
