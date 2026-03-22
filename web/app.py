@@ -970,6 +970,11 @@ elif step == 2:
 elif step == 3:
     st.markdown('<div class="step-title">Step 3: 高级选项</div>', unsafe_allow_html=True)
 
+    # API Key 检查
+    if not st.session_state.get("llm_api_key"):
+        st.error("请先在左侧边栏配置 LLM API Key，否则无法进行分析。")
+        st.stop()
+
     name = st.session_state.confirmed_name or st.session_state.app_name_input
     plats = ", ".join("iOS" if p == "app_store" else "Android" for p in st.session_state.selected_platforms)
     ctrs = ", ".join(COUNTRIES.get(c, c) for c in st.session_state.selected_countries)
