@@ -756,7 +756,11 @@ if step == 1:
         with st.spinner("正在搜索 App Store 和 Google Play..."):
             ios_result = search_app_store(app_name)
             bundle_id = ios_result.get("bundle_id") if ios_result else None
-            gplay_result = search_google_play(app_name, bundle_id=bundle_id)
+            gplay_result = search_google_play(
+                app_name, bundle_id=bundle_id,
+                app_store_name=ios_result.get("app_name") if ios_result else None,
+                app_store_developer=ios_result.get("developer") if ios_result else None,
+            )
 
         st.session_state.app_name_input = app_name
         st.session_state.app_info_ios = ios_result

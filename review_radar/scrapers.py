@@ -104,8 +104,12 @@ def search_google_play(app_name: str, bundle_id: str | None = None,
             except Exception:
                 pass
 
-        # 2. 搜索并验证
-        results = gplay_search(app_name, n_hits=5, lang="en")
+        # 2. 搜索并验证（优先用 App Store 返回的正确名称，避免用户拼写错误导致搜不到）
+        search_term = app_store_name or app_name
+        results = gplay_search(search_term, n_hits=5, lang="en")
+        if not results and search_term != app_name:
+            # 如果纠正后的名称也搜不到，再试原始输入
+            results = gplay_search(app_name, n_hits=5, lang="en")
         if not results:
             return None
 
