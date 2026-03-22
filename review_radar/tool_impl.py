@@ -12,6 +12,7 @@ from review_radar.scrapers import (
 )
 from review_radar.prompts import (
     ANALYZE_BATCH_PROMPT, EVALUATE_PROMPT, FEATURE_ANALYSIS_PROMPT,
+    SEMANTIC_DEDUP_PROMPT,
     REPORT_EXECUTIVE_SUMMARY_PROMPT,
     REPORT_OUTLINE_PROMPT, REPORT_COUNTRY_CHAPTER_PROMPT,
     REPORT_OVERVIEW_PROMPT, REPORT_CROSS_COUNTRY_PROMPT,
@@ -313,6 +314,44 @@ def tool_feature_analysis(app_name: str, feature_stats: dict) -> dict:
         "features": result.get("features", []),
         "summary": result.get("summary", ""),
         "message": f"功能分析完成，识别到 {len(result.get('features', []))} 个功能模块",
+    }
+
+
+# ── Tool 3.6: semantic_dedup ─────────────────────────────────
+
+def tool_semantic_dedup(keywords: list[dict], pain_points: list[dict]) -> dict:
+    """语义去重：用 LLM 识别关键词和痛点中的同义词组"""
+    keywords_json = json.dumps(
+        [kw["word"] for kw in keywords[:30]],
+        ensure_ascii=False,
+    )
+    pain_points_json = json.dumps(
+        [pp["description"] for pp in pain_points[:15]],
+        ensure_ascii=False,
+    )
+
+    prompt = SEMANTIC_DEDUP_PROMPT.format(
+        keywords_json=keywords_json,
+        pain_points_json=pain_points_json,
+    )
+
+    text = chat_simple(prompt, max_tokens=2000)
+    result = _extract_json(text)
+
+    if result is None:
+        return {
+            "keyword_groups": [],
+            "pain_point_groups": [],
+            "message": "语义去重结果解析失败，跳过去重",
+        }
+
+    return {
+        "keyword_groups": result.get("keyword_groups", []),
+        "pain_point_groups": result.get("pain_point_groups", []),
+        "message": (
+            f"语义去重完成：合并 {len(result.get('keyword_groups', []))} 组关键词，"
+            f"{len(result.get('pain_point_groups', []))} 组痛点"
+        ),
     }
 
 

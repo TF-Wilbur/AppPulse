@@ -16,10 +16,10 @@ import review_radar.config  # noqa: F401 — 确保 load_dotenv 被调用
 from review_radar.scrapers import search_app_store, search_google_play
 from review_radar.availability import check_availability_sync, COUNTRIES
 from review_radar.agent import ReviewRadarAgent
-from review_radar.report import save_report
+from review_radar.report import save_report, generate_html_report
 from review_radar.providers import list_provider_names, get_provider, fetch_models
 from review_radar.llm import set_runtime_config, check_health
-from review_radar.history import save_analysis, list_analyses, get_analysis, user_hash_from_key
+from review_radar.history import save_analysis, list_analyses, get_analysis, delete_analysis, user_hash_from_key
 
 # ── 文件缓存（防 session 丢失）──
 from review_radar.config import CACHE_TTL, CACHE_DIR as _CACHE_DIR_CFG
@@ -100,7 +100,7 @@ defaults = {
     "country_availability": None,
     "selected_platforms": [],
     "selected_countries": [],
-    "count": 100,
+    "count": 200,
     "fetch_strategy": "mixed",
     "report": None,
     "aggregated": None,
@@ -216,18 +216,27 @@ with st.sidebar:
     else:
         history = []
     if history:
+        hist_search = st.text_input("搜索历史", placeholder="输入 App 名称...", key="hist_search", label_visibility="collapsed")
+        if hist_search:
+            history = [h for h in history if hist_search.lower() in h["app_name"].lower()]
         for h in history:
             ts = datetime.fromtimestamp(h["timestamp"], tz=timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
             label = f'{h["app_name"]} ({ts}, {h["review_count"]} 条)'
-            if st.button(label, key=f"hist_{h['id']}"):
-                record = get_analysis(user_hash=uh, analysis_id=h["id"])
-                if record:
-                    st.session_state.report = record.get("report_text", "")
-                    st.session_state.aggregated = record.get("aggregated")
-                    st.session_state.analyzed_reviews = None
-                    st.session_state.confirmed_name = record.get("app_name", "")
-                    st.session_state.elapsed = 0
-                    st.session_state.step = 4
+            col_load, col_del = st.columns([4, 1])
+            with col_load:
+                if st.button(label, key=f"hist_{h['id']}"):
+                    record = get_analysis(user_hash=uh, analysis_id=h["id"])
+                    if record:
+                        st.session_state.report = record.get("report_text", "")
+                        st.session_state.aggregated = record.get("aggregated")
+                        st.session_state.analyzed_reviews = record.get("analyzed_reviews")
+                        st.session_state.confirmed_name = record.get("app_name", "")
+                        st.session_state.elapsed = 0
+                        st.session_state.step = 4
+                        st.rerun()
+            with col_del:
+                if st.button("🗑", key=f"del_{h['id']}", help="删除此记录"):
+                    delete_analysis(user_hash=uh, analysis_id=h["id"])
                     st.rerun()
     else:
         st.caption("暂无历史记录")
@@ -256,7 +265,7 @@ st.markdown("---")
 # ════════════════════════════════════════════════════════════════
 def _render_sentiment_pie(sentiment: dict, title: str):
     """情感分布饼图"""
-    colors_map = {"positive": "#4CAF50", "negative": "#E57373", "neutral": "#BDBDBD"}
+    colors_map = {"positive": "#4285F4", "negative": "#EA8600", "neutral": "#9AA0A6"}
     labels_cn = {"positive": "正面", "negative": "负面", "neutral": "中性"}
     fig = go.Figure(data=[go.Pie(
         labels=[labels_cn.get(k, k) for k in sentiment.keys()],
@@ -285,7 +294,7 @@ def _render_category_bar(categories: dict, title: str):
 def _render_rating_dist(rating_dist: dict, title: str):
     """评分分布柱状图"""
     stars = sorted(rating_dist.keys(), key=lambda x: int(x))
-    colors_rating = {1: "#E57373", 2: "#FFB74D", 3: "#FFD54F", 4: "#AED581", 5: "#4CAF50"}
+    colors_rating = {1: "#D93025", 2: "#EA8600", 3: "#F9AB00", 4: "#5BB974", 5: "#4285F4"}
     fig3 = go.Figure(data=[go.Bar(
         x=[f"{s} 星" for s in stars],
         y=[rating_dist[s] for s in stars],
@@ -303,6 +312,7 @@ def _render_version_trend(version_trends: dict, title: str):
     """版本评分趋势图"""
     vt = {k: v for k, v in version_trends.items() if k != "unknown"}
     if not vt:
+        st.info("📊 无有效版本数据，无法生成版本趋势图。")
         return
 
     def _version_sort_key(v):
@@ -340,6 +350,7 @@ def _render_time_trend(analyzed_reviews: list[dict], title: str):
 
     dated = [r for r in analyzed_reviews if r.get("date")]
     if len(dated) < 5:
+        st.info(f"📊 有日期的评论不足 5 条（当前 {len(dated)} 条），无法生成时间趋势图。建议增加抓取数量。")
         return
 
     weekly = defaultdict(lambda: {"positive": 0, "negative": 0, "neutral": 0, "total": 0})
@@ -354,6 +365,7 @@ def _render_time_trend(analyzed_reviews: list[dict], title: str):
         weekly[week_key]["total"] += 1
 
     if len(weekly) < 3:
+        st.info(f"📊 评论时间跨度不足 3 天（当前 {len(weekly)} 天），无法生成时间趋势图。")
         return
 
     st.markdown(f"**情感时间趋势 — {title}**")
@@ -361,15 +373,15 @@ def _render_time_trend(analyzed_reviews: list[dict], title: str):
     fig_time = go.Figure()
     fig_time.add_trace(go.Scatter(
         x=sorted_weeks, y=[weekly[w]["positive"] for w in sorted_weeks],
-        name="正面", mode="lines", line=dict(color="#4CAF50", width=2), stackgroup="one",
+        name="正面", mode="lines", line=dict(color="#4285F4", width=2), stackgroup="one",
     ))
     fig_time.add_trace(go.Scatter(
         x=sorted_weeks, y=[weekly[w]["neutral"] for w in sorted_weeks],
-        name="中性", mode="lines", line=dict(color="#BDBDBD", width=2), stackgroup="one",
+        name="中性", mode="lines", line=dict(color="#9AA0A6", width=2), stackgroup="one",
     ))
     fig_time.add_trace(go.Scatter(
         x=sorted_weeks, y=[weekly[w]["negative"] for w in sorted_weeks],
-        name="负面", mode="lines", line=dict(color="#E57373", width=2), stackgroup="one",
+        name="负面", mode="lines", line=dict(color="#EA8600", width=2), stackgroup="one",
     ))
     fig_time.update_layout(
         margin=dict(t=20, b=20, l=20, r=20), height=280,
@@ -412,15 +424,16 @@ def _render_pain_points(pain_points: list, title: str, analyzed_reviews: list[di
                             f'—— v{html_mod.escape(str(r.get("version", "?")))}, {r.get("date", "?")}'
                         )
                 else:
-                    st.caption("暂无匹配的原始评论")
+                    st.caption("该痛点暂无匹配的原始评论，可能是聚合分析中识别的问题")
             else:
-                st.caption("暂无原始评论数据")
+                st.caption("历史记录中未保存原始评论数据，重新分析可查看详情")
 
 
 def _render_feature_table(feature_stats: dict, title: str):
     """功能满意度表格"""
     import pandas as pd
     if not feature_stats or len(feature_stats) < 2:
+        st.info("📊 识别到的功能模块不足 2 个，无法生成功能满意度表格。")
         return
     st.markdown(f"**功能满意度 — {title}**")
     feat_data = []
@@ -534,6 +547,10 @@ def _show_results():
         </div>
         ''', unsafe_allow_html=True)
 
+    # 样本量警告
+    if total < 500:
+        st.warning(f"⚠️ 当前样本量 {total} 条，统计置信度有限。建议抓取 ≥500 条评论以获得更可靠的分析结论。")
+
     # 按国家 tab 展示图表
     if len(countries) > 1:
         country_labels = [COUNTRIES.get(c, c) for c in countries] + ["全局"]
@@ -600,9 +617,9 @@ def _show_results():
         page_reviews = filtered[page * page_size : (page + 1) * page_size]
 
         for r in page_reviews:
-            plat_label = "🍎" if r.get("platform") == "app_store" else "🤖"
+            plat_label = "🍎 App Store" if r.get("platform") == "app_store" else "🤖 Google Play"
             stars = "★" * r.get("rating", 0) + "☆" * (5 - r.get("rating", 0))
-            sent_emoji = {"positive": "😊", "negative": "😞", "neutral": "😐"}.get(r.get("sentiment", ""), "")
+            sent_emoji = {"positive": "😊 正面", "negative": "😞 负面", "neutral": "😐 中性"}.get(r.get("sentiment", ""), "")
             version = r.get("version", "")
             date = r.get("date", "")
             content = r.get("content", "")[:300]
@@ -652,17 +669,28 @@ def _show_results():
     # 完整报告
     st.markdown("---")
     st.markdown('<div class="section-title">完整报告</div>', unsafe_allow_html=True)
+    if total < 500:
+        st.caption(f"📊 本报告基于 {total} 条评论样本，统计置信度有限，结论仅供参考。")
     st.markdown(report)
 
     # 下载 + 重新分析
     st.markdown("---")
-    col_dl, col_new = st.columns(2)
-    with col_dl:
+    col_dl_md, col_dl_html, col_new = st.columns(3)
+    with col_dl_md:
         st.download_button(
             label="下载 Markdown 报告",
             data=report,
             file_name=f"{app_name}-评论洞察-{datetime.now().strftime('%Y%m%d')}.md",
             mime="text/markdown",
+            use_container_width=True,
+        )
+    with col_dl_html:
+        html_report = generate_html_report(report, app_name)
+        st.download_button(
+            label="下载 HTML 报告",
+            data=html_report,
+            file_name=f"{app_name}-评论洞察-{datetime.now().strftime('%Y%m%d')}.html",
+            mime="text/html",
             use_container_width=True,
         )
     with col_new:
@@ -914,7 +942,7 @@ elif step == 4:
     app_name_for_cache = st.session_state.get("confirmed_name") or st.session_state.get("app_name_input") or ""
     countries_for_cache = st.session_state.get("selected_countries") or ["us"]
     platforms_for_cache = st.session_state.get("selected_platforms") or ["app_store"]
-    count_for_cache = st.session_state.get("count", 200)
+    count_for_cache = st.session_state.get("count", 200)  # 与 count_input 默认值一致
 
     if app_name_for_cache:
         ck = _cache_key(app_name_for_cache, countries_for_cache, platforms_for_cache, count_for_cache)
@@ -944,6 +972,8 @@ elif step == 4:
             "logs": [],
             "lock": threading.Lock(),
             "start_time": None,
+            "phase_number": 0,
+            "total_phases": 5,
         }
 
     task_key = f"analysis_{app_name_for_cache}_{count_for_cache}"
@@ -955,6 +985,11 @@ elif step == 4:
 
     def on_event(event_type, data):
         if event_type == "phase":
+            phase_number = data.get("phase_number", 0)
+            total_phases = data.get("total_phases", 5)
+            with task["lock"]:
+                task["phase_number"] = phase_number
+                task["total_phases"] = total_phases
             _log_to_task("🔄", f"**{data.get('phase', '')}**")
         elif event_type == "tool_call":
             _log_to_task("  ⚙️", data.get("input_summary", ""))
@@ -996,11 +1031,17 @@ elif step == 4:
 
     # ── 显示进度 ──
     with st.status("正在分析...", expanded=True) as status_ui:
+        progress_bar = st.progress(0)
+        phase_label = st.empty()
         log_area = st.empty()
 
         while task["future"] and not task["future"].done():
             with task["lock"]:
                 snapshot = list(task["logs"][-20:])
+                p_num = task["phase_number"]
+                p_total = task["total_phases"]
+            progress_val = min(p_num / max(p_total, 1), 1.0)
+            progress_bar.progress(progress_val, text=f"阶段 {p_num}/{p_total}")
             if snapshot:
                 log_area.markdown("\n\n".join(snapshot))
             time.sleep(2)
@@ -1008,6 +1049,7 @@ elif step == 4:
         # 最终刷新
         with task["lock"]:
             snapshot = list(task["logs"][-20:])
+        progress_bar.progress(1.0, text="完成")
         if snapshot:
             log_area.markdown("\n\n".join(snapshot))
 
@@ -1064,6 +1106,7 @@ elif step == 4:
                     review_count=len(agent.analyzed_reviews or []),
                     aggregated=agent.aggregated,
                     report=report,
+                    analyzed_reviews=agent.analyzed_reviews,
                 )
         except Exception:
             pass  # 历史保存失败不影响主流程

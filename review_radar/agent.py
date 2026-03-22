@@ -9,6 +9,7 @@ from review_radar.tool_impl import (
     tool_search_app, tool_fetch_reviews,
     tool_analyze_batch, tool_evaluate_coverage,
     tool_generate_report, tool_feature_analysis,
+    tool_semantic_dedup,
 )
 from review_radar.availability import COUNTRIES
 from review_radar.config import BATCH_SIZE, FETCH_MAX_WORKERS, ANALYZE_MAX_WORKERS, FETCH_DELAY
@@ -55,7 +56,7 @@ class ReviewRadarAgent:
 
         # ── Phase 0: 搜索 App（如果没有传入 ID）──
         if not app_store_id and not google_play_id:
-            self.on_event("phase", {"phase": "Phase 0: 识别 App"})
+            self.on_event("phase", {"phase": "Phase 0: 识别 App", "phase_number": 0, "total_phases": 5})
             self.on_event("tool_call", {"tool": "search_app", "input_summary": f"搜索 App: {app_name}"})
             app_info = tool_search_app(app_name, countries[0])
             self.on_event("tool_result", {"tool": "search_app", "message": app_info.get("message", "")})
@@ -71,7 +72,7 @@ class ReviewRadarAgent:
         display_name = app_info.get("app_name_en") or app_name
 
         # ── Phase 1: 抓取评论（多国家多平台，并发）──
-        self.on_event("phase", {"phase": "Phase 1: 抓取评论"})
+        self.on_event("phase", {"phase": "Phase 1: 抓取评论", "phase_number": 1, "total_phases": 5})
         all_reviews = []
 
         use_ios = "app_store" in platforms and app_store_id
@@ -166,7 +167,7 @@ class ReviewRadarAgent:
             })
 
         # ── Phase 2: 分批分析（并发）──
-        self.on_event("phase", {"phase": "Phase 2: 分批分析"})
+        self.on_event("phase", {"phase": "Phase 2: 分批分析", "phase_number": 2, "total_phases": 5})
         batches = [quality_reviews[i:i + BATCH_SIZE] for i in range(0, len(quality_reviews), BATCH_SIZE)]
         all_batch_results = [None] * len(batches)
 
@@ -226,7 +227,7 @@ class ReviewRadarAgent:
         # ── Phase 2.5: 功能级分析 ──
         feature_data = aggregated.get("global", {}).get("feature_stats", {})
         if feature_data:
-            self.on_event("phase", {"phase": "Phase 2.5: 功能级分析"})
+            self.on_event("phase", {"phase": "Phase 2.5: 功能级分析", "phase_number": 2, "total_phases": 5})
             self.on_event("tool_call", {"tool": "feature_analysis", "input_summary": "生成功能满意度分析"})
             feature_result = tool_feature_analysis(display_name, feature_data)
             self.on_event("tool_result", {"tool": "feature_analysis", "message": feature_result.get("message", "")})
@@ -234,7 +235,7 @@ class ReviewRadarAgent:
             aggregated["feature_summary"] = feature_result.get("summary", "")
 
         # ── Phase 3: 评估质量 ──
-        self.on_event("phase", {"phase": "Phase 3: 评估质量"})
+        self.on_event("phase", {"phase": "Phase 3: 评估质量", "phase_number": 3, "total_phases": 5})
         # 用 global 数据做评估
         global_agg = aggregated.get("global", {})
         global_agg["total_reviews"] = aggregated.get("total_reviews", 0)
@@ -262,8 +263,58 @@ class ReviewRadarAgent:
             global_agg = self._apply_improvements(global_agg, actions)
             aggregated["global"] = global_agg
 
+        # ── Phase 3.5: 语义去重（跨语言同义词合并）──
+        self.on_event("phase", {"phase": "Phase 3.5: 语义去重", "phase_number": 3, "total_phases": 5})
+        global_keywords = global_agg.get("top_keywords", [])
+        global_pain_points = global_agg.get("top_pain_points", [])
+
+        if global_keywords or global_pain_points:
+            self.on_event("tool_call", {"tool": "semantic_dedup", "input_summary": "识别同义词并合并"})
+            dedup_result = tool_semantic_dedup(global_keywords, global_pain_points)
+            self.on_event("tool_result", {"tool": "semantic_dedup", "message": dedup_result.get("message", "")})
+
+            # 应用关键词合并
+            kw_merge_map = {}  # synonym -> primary
+            for group in dedup_result.get("keyword_groups", []):
+                primary = group.get("primary", "")
+                for syn in group.get("synonyms", []):
+                    kw_merge_map[syn] = primary
+
+            if kw_merge_map:
+                global_agg = self._apply_semantic_dedup_keywords(global_agg, kw_merge_map)
+                # 同步更新 analyzed_reviews 中的关键词
+                for ar in self.analyzed_reviews:
+                    ar["keywords"] = [kw_merge_map.get(kw, kw) for kw in (ar.get("keywords") or [])]
+
+            # 应用痛点合并
+            pp_merge_map = {}
+            for group in dedup_result.get("pain_point_groups", []):
+                primary = group.get("primary", "")
+                for syn in group.get("synonyms", []):
+                    pp_merge_map[syn] = primary
+
+            if pp_merge_map:
+                global_agg = self._apply_semantic_dedup_pain_points(global_agg, pp_merge_map)
+                # 同步更新 analyzed_reviews 中的痛点
+                for ar in self.analyzed_reviews:
+                    pp = ar.get("pain_point")
+                    if pp and pp in pp_merge_map:
+                        ar["pain_point"] = pp_merge_map[pp]
+
+            aggregated["global"] = global_agg
+
+            # 对每个国家的数据也做同样的合并
+            for c_code in countries:
+                c_data = aggregated.get("by_country", {}).get(c_code, {}).get("combined", {})
+                if c_data:
+                    if kw_merge_map:
+                        c_data = self._apply_semantic_dedup_keywords(c_data, kw_merge_map)
+                    if pp_merge_map:
+                        c_data = self._apply_semantic_dedup_pain_points(c_data, pp_merge_map)
+                    aggregated["by_country"][c_code]["combined"] = c_data
+
         # ── Phase 4: 生成报告（多国家动态章节）──
-        self.on_event("phase", {"phase": "Phase 4: 生成报告"})
+        self.on_event("phase", {"phase": "Phase 4: 生成报告", "phase_number": 4, "total_phases": 5})
 
         # Step 0: 执行摘要
         self.on_event("tool_call", {"tool": "generate_report", "input_summary": "生成执行摘要"})
@@ -535,4 +586,45 @@ class ReviewRadarAgent:
                         deduped.append(pp)
                 aggregated["top_pain_points"] = deduped[:10]
 
+        return aggregated
+
+    def _apply_semantic_dedup_keywords(self, aggregated: dict, merge_map: dict) -> dict:
+        """应用语义去重：合并关键词同义词"""
+        keywords = aggregated.get("top_keywords", [])
+        merged: dict[str, int] = {}
+        for kw in keywords:
+            word = kw["word"]
+            primary = merge_map.get(word, word)
+            merged[primary] = merged.get(primary, 0) + kw["count"]
+        aggregated["top_keywords"] = sorted(
+            [{"word": w, "count": c} for w, c in merged.items()],
+            key=lambda x: x["count"], reverse=True,
+        )[:20]
+        return aggregated
+
+    def _apply_semantic_dedup_pain_points(self, aggregated: dict, merge_map: dict) -> dict:
+        """应用语义去重：合并痛点同义表达"""
+        pain_points = aggregated.get("top_pain_points", [])
+        merged: dict[str, dict] = {}
+        for pp in pain_points:
+            desc = pp["description"]
+            primary = merge_map.get(desc, desc)
+            if primary in merged:
+                merged[primary]["mention_count"] += pp["mention_count"]
+                # 保留更高的严重程度
+                sev_order = {"high": 3, "medium": 2, "low": 1}
+                if sev_order.get(pp.get("severity", "medium"), 2) > sev_order.get(merged[primary].get("severity", "medium"), 2):
+                    merged[primary]["severity"] = pp["severity"]
+            else:
+                merged[primary] = {
+                    "description": primary,
+                    "mention_count": pp["mention_count"],
+                    "severity": pp.get("severity", "medium"),
+                }
+        severity_weight = {"high": 3, "medium": 2, "low": 1}
+        aggregated["top_pain_points"] = sorted(
+            list(merged.values()),
+            key=lambda x: x["mention_count"] * severity_weight.get(x.get("severity", "medium"), 2),
+            reverse=True,
+        )[:10]
         return aggregated

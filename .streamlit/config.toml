@@ -1,7 +1,7 @@
 [server]
 headless = true
 enableCORS = false
-enableXsrfProtection = false
+enableXsrfProtection = true
 maxUploadSize = 5
 # 防止长时间任务时 WebSocket 断连
 enableWebsocketCompression = false
