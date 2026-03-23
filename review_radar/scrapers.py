@@ -238,8 +238,11 @@ def fetch_app_store_reviews(
     extra_pages = 5 if (date_from or date_to) else 0
     max_pages = (count // 50) + 2 + extra_pages
     consecutive_failures = 0
+    # 按最新排序时，遇到早于 date_from 的评论可以提前终止
+    sort_is_recent = sort in ("mostrecent",)
+    hit_old_review = False
 
-    while len(reviews) < count and page <= max_pages:
+    while len(reviews) < count and page <= max_pages and not hit_old_review:
         def _fetch_page(p=page):
             url = (
                 f"https://itunes.apple.com/{country}/rss/customerreviews"
@@ -284,6 +287,8 @@ def fetch_app_store_reviews(
 
             # 日期过滤
             if date_from and date_str < date_from:
+                if sort_is_recent:
+                    hit_old_review = True
                 continue
             if date_to and date_str > date_to:
                 continue
@@ -333,13 +338,16 @@ def fetch_google_play_reviews(
     # 有日期过滤时多抓几页，因为过滤后数量会减少
     extra_pages = 5 if (date_from or date_to) else 0
     max_pages = max((count // per_page) + 3, 5) + extra_pages
+    # 按最新排序时，遇到早于 date_from 的评论可以提前终止
+    sort_is_newest = sort == "newest"
+    hit_old_review = False
 
     logger.info("Google Play 开始抓取: app=%s, count=%d, per_page=%d, max_pages=%d, sort=%s",
                 app_id, count, per_page, max_pages, sort)
 
     try:
         for page in range(max_pages):
-            if len(reviews) >= count:
+            if len(reviews) >= count or hit_old_review:
                 break
 
             current_token = continuation_token  # 显式捕获当前 token
@@ -369,6 +377,8 @@ def fetch_google_play_reviews(
 
                 # 日期过滤
                 if date_from and date_str < date_from:
+                    if sort_is_newest:
+                        hit_old_review = True
                     continue
                 if date_to and date_str > date_to:
                     continue

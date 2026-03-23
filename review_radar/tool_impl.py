@@ -125,6 +125,10 @@ def tool_fetch_reviews(
     if not app_store_id and not google_play_id:
         return {"error": "至少需要提供 app_store_id 或 google_play_id"}
 
+    # 有日期过滤时，强制使用 recent 策略（mixed 中的 relevant/mosthelpful 排序会返回大量老评论）
+    if (date_from or date_to) and fetch_strategy == "mixed":
+        fetch_strategy = "recent"
+
     use_ios = app_store_id and (not platforms or "app_store" in platforms)
     use_gplay = google_play_id and (not platforms or "google_play" in platforms)
 
